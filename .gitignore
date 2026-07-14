@@ -4,4 +4,6 @@ build-native/
 native-inspect/
 native-run/
 *.deb
+*.Msixbundle
 .DS_Store
+.idea/

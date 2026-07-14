@@ -1,0 +1,10 @@
+{
+  "name": "chatgpt-desktop-native-build",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Local build tooling for repackaging the official ChatGPT MSIX into a native Linux Electron .deb",
+  "devDependencies": {
+    "@electron/asar": "^3.2.0",
+    "electron": "^39.0.0"
+  }
+}

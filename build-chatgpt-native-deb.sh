@@ -3,11 +3,16 @@ set -euo pipefail
 
 readonly PACKAGE_NAME="chatgpt-desktop-native"
 readonly APP_NAME="ChatGPT"
+# The Electron binary must NOT be named "electron": app.isPackaged is false
+# whenever basename(execPath) == "electron", which sends the app down its
+# dev-mode resource-path branch and breaks the tray icon (loads it from a
+# path inside the asar that does not exist -> empty/invisible tray icon).
+readonly ELECTRON_BIN_NAME="chatgpt"
 readonly MAINTAINER="${MAINTAINER:-JohnO Local Build}"
 readonly DESCRIPTION="ChatGPT desktop app repackaged from the official Windows MSIX into a native Linux Electron package"
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INPUT_PAYLOAD="${PROJECT_ROOT}/OpenAI.ChatGPT-Desktop_2026.212.2039.0.Msixbundle"
+INPUT_PAYLOAD=""
 OUT_DIR="${PROJECT_ROOT}/dist"
 BUILD_DIR="${PROJECT_ROOT}/build-native"
 ARCH="amd64"
@@ -29,6 +34,7 @@ Usage: $0 [options]
 
 Options:
   --exe PATH         Path to the ChatGPT MSIX/MSIXBundle payload
+                     (default: newest bundle found in the project folder)
   --version VERSION  Override package version
   --out-dir DIR      Output directory for the built .deb
   --clean yes|no     Remove build directory after success (default: yes)
@@ -69,7 +75,7 @@ parse_args() {
 check_deps() {
   section "Dependency Check"
   local missing=()
-  for cmd in file dpkg-deb python3 node; do
+  for cmd in file dpkg-deb python3 node npm; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
 
@@ -84,8 +90,38 @@ check_deps() {
   fi
 }
 
+discover_payload() {
+  # Pick the newest MSIX/AppX payload in the project folder by parsed version.
+  PROJECT_ROOT="$PROJECT_ROOT" python3 - <<'PY'
+import glob, os, re
+
+root = os.environ["PROJECT_ROOT"]
+exts = ("*.Msixbundle", "*.msixbundle", "*.msix", "*.appx", "*.appxbundle")
+candidates = []
+for pat in exts:
+    candidates.extend(glob.glob(os.path.join(root, pat)))
+candidates = sorted(set(candidates))
+
+def ver_key(path):
+    m = re.search(r'_(\d+(?:\.\d+)*)\.(?:msix|appx)', os.path.basename(path), re.I)
+    if m:
+        return tuple(int(x) for x in m.group(1).split("."))
+    return (0,)
+
+if candidates:
+    print(max(candidates, key=lambda p: (ver_key(p), os.path.getmtime(p))))
+PY
+}
+
 validate_input() {
   section "Input Validation"
+
+  if [[ -z "$INPUT_PAYLOAD" ]]; then
+    INPUT_PAYLOAD="$(discover_payload)"
+    [[ -n "$INPUT_PAYLOAD" ]] || die "no MSIX/AppX bundle found in ${PROJECT_ROOT} (pass one with --exe, or run ./download-latest-msixbundle.py)"
+    printf "auto-selected newest bundle: %s\n" "$INPUT_PAYLOAD"
+  fi
+
   [[ -f "$INPUT_PAYLOAD" ]] || die "input file not found: $INPUT_PAYLOAD"
 
   local detected
@@ -165,15 +201,63 @@ PY
   [[ -d "$BUILD_DIR/payload/assets" ]] || die "missing assets directory in extracted payload"
 }
 
+align_electron() {
+  section "Electron Version Alignment"
+
+  # The upstream Windows payload ships the exact Electron version the app was
+  # built against in app/version. The app's minified main process assumes that
+  # Electron's behavior/ABI; staging a different major (the local ^X.0.0 float
+  # can drift several majors behind upstream) risks subtle, silent breakage.
+  # So read the required version and, on mismatch, pull the matching Electron
+  # into node_modules before patch_app stages it.
+  local required have
+  required="$(tr -d '[:space:]' < "$BUILD_DIR/payload/app/version" 2>/dev/null || true)"
+  required="${required#v}"
+  if [[ -z "$required" ]]; then
+    printf "could not read payload/app/version; using installed Electron as-is\n"
+    return
+  fi
+
+  have="$(tr -d '[:space:]' < "${PROJECT_ROOT}/node_modules/electron/dist/version" 2>/dev/null || true)"
+  have="${have#v}"
+
+  printf "app was built against Electron: %s\n" "$required"
+  printf "staged Electron:               %s\n" "${have:-unknown}"
+
+  if [[ "$have" == "$required" ]]; then
+    printf "already aligned\n"
+    return
+  fi
+
+  printf "mismatch -> installing electron@%s\n" "$required"
+  if npm --prefix "$PROJECT_ROOT" install "electron@${required}" \
+       --no-save --no-package-lock --no-audit --no-fund >/dev/null 2>&1; then
+    have="$(tr -d '[:space:]' < "${PROJECT_ROOT}/node_modules/electron/dist/version" 2>/dev/null || true)"
+    have="${have#v}"
+    printf "installed Electron: %s\n" "${have:-unknown}"
+  else
+    printf "\033[1;33mwarning:\033[0m npm could not install electron@%s (offline?)\n" "$required"
+  fi
+
+  if [[ "$have" != "$required" ]]; then
+    if [[ "${have%%.*}" == "${required%%.*}" ]]; then
+      printf "\033[1;33mwarning:\033[0m proceeding with Electron %s (same major as required %s)\n" \
+        "$have" "$required"
+    else
+      die "Electron major mismatch: app needs $required but only $have is available; run 'npm install electron@$required' and rebuild"
+    fi
+  fi
+}
+
 patch_app() {
   section "Patch Official App"
   cp "$BUILD_DIR/payload/app/resources/app.asar" "$BUILD_DIR/app.asar"
   "${PROJECT_ROOT}/node_modules/.bin/asar" extract "$BUILD_DIR/app.asar" "$BUILD_DIR/app"
 
-  node - "$BUILD_DIR/app/.vite/build/main-h-3WI1BF.js" <<'NODE'
+  node - "$BUILD_DIR/app/.vite/build" <<'NODE'
 const fs = require('fs');
-const path = process.argv[2];
-let src = fs.readFileSync(path, 'utf8');
+const path = require('path');
+const buildDir = process.argv[2];
 
 const replacements = [
   {
@@ -198,6 +282,31 @@ const replacements = [
   }
 ];
 
+// The bundled main process lives in a hash-named file (e.g. main-B4qvGjkf.js)
+// that changes every release, so locate it by content instead of by name.
+const anchor = replacements[0].from;
+const candidates = fs
+  .readdirSync(buildDir)
+  .filter((n) => n.endsWith('.js'))
+  .map((n) => path.join(buildDir, n));
+
+const hits = candidates.filter((p) => fs.readFileSync(p, 'utf8').includes(anchor));
+
+if (hits.length === 0) {
+  console.error(`no JS file in ${buildDir} contains the expected patch target`);
+  console.error(`  looked for: ${anchor.slice(0, 80)}`);
+  console.error('  the upstream app likely changed; patch strings need updating');
+  process.exit(1);
+}
+if (hits.length > 1) {
+  console.error(`ambiguous patch target, matched multiple files: ${hits.join(', ')}`);
+  process.exit(1);
+}
+
+const target = hits[0];
+console.log(`patching ${path.basename(target)}`);
+let src = fs.readFileSync(target, 'utf8');
+
 for (const { from, to } of replacements) {
   if (!src.includes(from)) {
     console.error(`missing expected patch target: ${from.slice(0, 80)}`);
@@ -206,7 +315,55 @@ for (const { from, to } of replacements) {
   src = src.replace(from, to);
 }
 
-fs.writeFileSync(path, src);
+fs.writeFileSync(target, src);
+NODE
+
+  # Inject the window-state module (remembers the window's position/size/maximized
+  # state across restarts and, on first run, centers on the primary display). The
+  # module is a standalone, public-API-only file dropped next to the bundled main
+  # process; we then wire it into the window manager via an import + a single call
+  # right after the main BrowserWindow is constructed.
+  cp "${PROJECT_ROOT}/include/window-state.mjs" "$BUILD_DIR/app/.vite/build/window-state.mjs"
+
+  node - "$BUILD_DIR/app/.vite/build" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const buildDir = process.argv[2];
+
+const importLine = 'import { installWindowState } from "./window-state.mjs";\n';
+// `this.mainWindow` and `.constructorOptions` are semantic names the minifier
+// keeps, so match the surrounding minified identifiers (BrowserWindow, config
+// fn) with \w+ to stay resilient across upstream releases.
+const anchorRe = /this\.mainWindow = new (\w+)\((\w+)\(\)\.constructorOptions\)/;
+
+const candidates = fs
+  .readdirSync(buildDir)
+  .filter((n) => n.endsWith('.js'))
+  .map((n) => path.join(buildDir, n));
+
+const hits = candidates.filter((p) => anchorRe.test(fs.readFileSync(p, 'utf8')));
+
+if (hits.length === 0) {
+  console.error(`no JS file in ${buildDir} contains the main-window creation anchor`);
+  console.error('  looked for: this.mainWindow = new <Win>(<cfg>().constructorOptions)');
+  console.error('  the upstream app likely changed; window-state injection needs updating');
+  process.exit(1);
+}
+if (hits.length > 1) {
+  console.error(`ambiguous window-state anchor, matched multiple files: ${hits.join(', ')}`);
+  process.exit(1);
+}
+
+const target = hits[0];
+console.log(`injecting window-state into ${path.basename(target)}`);
+let src = fs.readFileSync(target, 'utf8');
+
+src = src.replace(anchorRe, (m) => `${m}, installWindowState(this.mainWindow)`);
+if (!src.startsWith(importLine)) {
+  src = importLine + src;
+}
+
+fs.writeFileSync(target, src);
 NODE
 
   cp -a "$BUILD_DIR/payload/assets" "$BUILD_DIR/staged-assets"
@@ -232,10 +389,27 @@ build_deb() {
   cp -a "$BUILD_DIR/staged-electron" "$install_root/electron"
   cp -a "$BUILD_DIR/staged-assets" "$install_root/assets"
 
+  # Electron derives the X11 WM_CLASS from the app's productName (e.g.
+  # "ChatGPT Classic"), so the .desktop StartupWMClass must match that exact
+  # string for GNOME to bind the running window to this launcher (correct icon
+  # + name instead of a generic, icon-less entry). Read it from the app's own
+  # package.json so it stays correct even if upstream renames the product.
+  local wm_class
+  wm_class="$(node -e 'process.stdout.write((require(process.argv[1]).productName||require(process.argv[1]).name||"electron"))' "$BUILD_DIR/app/package.json")"
+  [[ -n "$wm_class" ]] || wm_class="electron"
+  printf 'desktop StartupWMClass: %s\n' "$wm_class"
+
+  # Rename the Electron binary so app.isPackaged is true on Linux (see note by
+  # ELECTRON_BIN_NAME). Without this the system tray icon is invisible.
+  mv "$install_root/electron/electron" "$install_root/electron/$ELECTRON_BIN_NAME"
+
+  # No --no-sandbox: the Chromium sandbox stays enabled. It relies on the
+  # chrome-sandbox helper being setuid-root, which the package's postinst sets
+  # up at install time (see build_control below).
   cat > "$bin_dir/$PACKAGE_NAME" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exec /opt/$PACKAGE_NAME/electron/electron --no-sandbox "\$@"
+exec /opt/$PACKAGE_NAME/electron/$ELECTRON_BIN_NAME "\$@"
 EOF
   chmod 0755 "$bin_dir/$PACKAGE_NAME"
 
@@ -270,8 +444,8 @@ Icon=$PACKAGE_NAME
 Type=Application
 Terminal=false
 Categories=Utility;
-StartupWMClass=electron
-X-GNOME-WMClass=electron
+StartupWMClass=$wm_class
+X-GNOME-WMClass=$wm_class
 MimeType=x-scheme-handler/chatgpt;x-scheme-handler/chatgpt-alt;
 EOF
 
@@ -286,9 +460,21 @@ Depends: libgtk-3-0, libnss3, libxss1, libasound2t64 | libasound2, libgbm1, libx
 Description: $DESCRIPTION
 EOF
 
-  cat > "$pkg_root/DEBIAN/postinst" <<'EOF'
+  cat > "$pkg_root/DEBIAN/postinst" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+
+# The Chromium sandbox on Linux requires its helper binary to be owned by root
+# with the setuid bit set. Without this the app either refuses to start or has
+# to be launched with --no-sandbox (which disables the sandbox entirely). We
+# set it here, as root, at install time instead. This mirrors what the official
+# VS Code / Slack / Discord Electron packages do.
+chrome_sandbox="/opt/$PACKAGE_NAME/electron/chrome-sandbox"
+if [[ -f "\$chrome_sandbox" ]]; then
+  chown root:root "\$chrome_sandbox"
+  chmod 4755 "\$chrome_sandbox"
+fi
+
 update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
 EOF
   chmod 0755 "$pkg_root/DEBIAN/postinst"
@@ -320,6 +506,7 @@ main() {
   prepare_dirs
   detect_version
   extract_payload
+  align_electron
   patch_app
   build_deb
   cleanup
